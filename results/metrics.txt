@@ -1,18 +1,35 @@
-Mackey-Glass quantum spin reservoir results
+Quantum spin reservoir time-series comparison
 
-One-step QRC RMSE, normalized scale:       0.005254
-One-step QRC RMSE, original scale:         0.001240
-Short free-run QRC RMSE, normalized scale: 0.077236
-Short free-run QRC RMSE, original scale:   0.018229
-Memoryless one-step baseline RMSE:         0.146814
-
-Reservoir:
+Same QRC settings for both tasks:
 - 5 qubits
 - 7 virtual measurement nodes per input
+- evolution time 0.65
+- ridge 0.0001
+- Hamiltonian seed 3
 - density-matrix state rho with shape (32, 32)
 
+Task results:
+
+Mackey-Glass:
+- QRC one-step RMSE, normalized scale:       0.005254
+- QRC one-step RMSE, original scale:         0.001240
+- Memoryless one-step baseline RMSE:         0.146814
+- Short free-run QRC RMSE, normalized scale: 0.077236
+- Short free-run QRC RMSE, original scale:   0.018229
+
+NARMA10:
+- QRC one-step RMSE, normalized scale:       0.649665
+- QRC one-step RMSE, original scale:         0.070224
+- Memoryless one-step baseline RMSE:         0.836093
+
+Takeaway:
+- Mackey-Glass is predicted very accurately by this small QRC.
+- NARMA10 is harder for the same reservoir settings.
+- This is the lesson: reservoir performance depends on the task,
+  even when the reservoir architecture is unchanged.
+
 Plot saved to:
-/Users/superposition/Documents/Codex/2026-06-30/cna/outputs/mackey_glass_spin_reservoir/results/mackey_glass_qrc_prediction.png
+results/qrc_time_series_comparison.png
 
 Notes:
 - The reservoir is a quantum spin system.

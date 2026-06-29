@@ -1,10 +1,19 @@
 """
-Introductory Mackey-Glass prediction with a quantum spin reservoir.
+Introductory time-series comparison with a quantum spin reservoir.
 
 Run:
-    python mackey_glass_spin_reservoir.py
+    python qrc_time_series_comparison.py
 
 This is a deliberately small Quantum Reservoir Computing (QRC) example.
+
+It runs the same quantum spin reservoir on two benchmark tasks:
+
+1. Mackey-Glass next-step prediction.
+2. NARMA10 input-output prediction.
+
+The point of the comparison is simple:
+
+    The same reservoir can work very well on one task and less well on another.
 
 What makes it a QRC example?
 
@@ -44,6 +53,8 @@ N_QUBITS = 5
 VIRTUAL_NODES = 7
 EVOLUTION_TIME = 0.65
 RIDGE = 1e-4
+
+NARMA_ORDER = 10
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +109,7 @@ def expectation(rho, operator):
 
 
 # ---------------------------------------------------------------------------
-# Mackey-Glass data
+# Benchmark data
 # ---------------------------------------------------------------------------
 
 
@@ -135,6 +146,33 @@ def make_mackey_glass(
         x[t + 1] = x[t] + dt * dx
 
     return x[tau + 1 :]
+
+
+def make_narma(n_points, order=NARMA_ORDER, seed=23):
+    """Generate a standard NARMA input-output benchmark.
+
+    NARMA is not a self-prediction task. The reservoir receives the external
+    input u(t), and the target is the NARMA output y(t).
+
+    For NARMA10, the next output depends on the current output, a sum of recent
+    outputs, and a product of delayed input values. This is a harder memory and
+    nonlinearity test than the Mackey-Glass one-step task in this example.
+    """
+
+    rng = np.random.default_rng(seed)
+    inputs = rng.uniform(0.0, 0.5, size=n_points)
+    outputs = np.zeros(n_points)
+
+    for t in range(order - 1, n_points - 1):
+        recent_output_sum = np.sum(outputs[t - order + 1 : t + 1])
+        outputs[t + 1] = (
+            0.3 * outputs[t]
+            + 0.05 * outputs[t] * recent_output_sum
+            + 1.5 * inputs[t - order + 1] * inputs[t]
+            + 0.1
+        )
+
+    return inputs, outputs
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +298,7 @@ class QuantumSpinReservoir:
 
         for _ in range(self.virtual_nodes):
             # This is the stateful quantum evolution:
-            # rho(t + dt) = U rho(t) U^\dagger
+            # rho(t + dt) = U rho(t) U_dagger
             self.rho = self.unitary @ self.rho @ self.unitary_dagger
 
             for operator in self.readout_operators:
@@ -290,10 +328,10 @@ class QuantumSpinReservoir:
 # ---------------------------------------------------------------------------
 
 
-def readout_features(current_value_z, qrc_measurements):
+def readout_features(current_input_z, qrc_measurements):
     """Combine bias, current input, and QRC memory measurements."""
 
-    return np.concatenate(([1.0, current_value_z], qrc_measurements))
+    return np.concatenate(([1.0, current_input_z], qrc_measurements))
 
 
 def fit_ridge_regression(features, targets, ridge):
@@ -313,18 +351,61 @@ def rmse(predictions, targets):
 
 
 def scale_to_unit_interval(values, train_min, train_max):
-    """Map original Mackey-Glass values to [0, 1] for input injection."""
+    """Map values to [0, 1] for input injection."""
+
+    if np.isclose(train_min, train_max):
+        return np.zeros_like(values)
 
     return np.clip((values - train_min) / (train_max - train_min), 0.0, 1.0)
 
 
+def z_score(values, train_mean, train_std):
+    """Normalize values using training statistics."""
+
+    if np.isclose(train_std, 0.0):
+        raise ValueError("Cannot z-score a constant training signal.")
+
+    return (values - train_mean) / train_std
+
+
 def denormalize(values_z, mean, std):
-    """Map normalized values back to the original Mackey-Glass scale."""
+    """Map normalized values back to the original scale."""
 
     return values_z * std + mean
 
 
-def train_qrc(series_z, input_values_01):
+def prepare_task_signals(input_signal, target_signal):
+    """Prepare input and target arrays without leaking test statistics."""
+
+    train_input = input_signal[:TRAIN_STEPS]
+    train_target = target_signal[:TRAIN_STEPS]
+
+    input_mean = train_input.mean()
+    input_std = train_input.std()
+    target_mean = train_target.mean()
+    target_std = train_target.std()
+
+    input_z = z_score(input_signal, input_mean, input_std)
+    target_z = z_score(target_signal, target_mean, target_std)
+
+    input_min = train_input.min()
+    input_max = train_input.max()
+    input_values_01 = scale_to_unit_interval(input_signal, input_min, input_max)
+
+    return {
+        "input_z": input_z,
+        "target_z": target_z,
+        "input_values_01": input_values_01,
+        "input_mean": input_mean,
+        "input_std": input_std,
+        "input_min": input_min,
+        "input_max": input_max,
+        "target_mean": target_mean,
+        "target_std": target_std,
+    }
+
+
+def train_qrc(input_z, target_z, input_values_01):
     """Run the training sequence once and fit the linear readout."""
 
     reservoir = QuantumSpinReservoir(
@@ -343,10 +424,8 @@ def train_qrc(series_z, input_values_01):
         # Washout lets the initially neutral quantum state synchronize with the
         # signal before we ask the readout to learn from it.
         if t >= WASHOUT_STEPS:
-            collected_features.append(
-                readout_features(series_z[t], qrc_measurements)
-            )
-            targets.append(series_z[t + 1])
+            collected_features.append(readout_features(input_z[t], qrc_measurements))
+            targets.append(target_z[t + 1])
 
     features = np.vstack(collected_features)
     targets = np.array(targets)
@@ -355,37 +434,35 @@ def train_qrc(series_z, input_values_01):
     return reservoir, readout_weights
 
 
-def predict_one_step(reservoir, readout_weights, series_z, input_values_01):
-    """Teacher-forced prediction: the true current value is always supplied."""
+def predict_one_step(reservoir, readout_weights, input_z, input_values_01):
+    """Teacher-forced prediction: the true current input is always supplied."""
 
     predictions = []
 
     for t in range(TRAIN_STEPS, TRAIN_STEPS + TEST_STEPS):
         qrc_measurements = reservoir.step(input_values_01[t])
-        features = readout_features(series_z[t], qrc_measurements)
+        features = readout_features(input_z[t], qrc_measurements)
         predictions.append(features @ readout_weights)
 
     return np.array(predictions)
 
 
-def predict_short_free_run(
+def predict_short_self_feedback_run(
     reservoir,
     readout_weights,
     first_input_z,
     train_z_min,
     train_z_max,
-    train_mean,
-    train_std,
-    train_min,
-    train_max,
+    input_mean,
+    input_std,
+    input_min,
+    input_max,
 ):
-    """Short autonomous rollout.
+    """Short autonomous rollout for self-prediction tasks.
 
-    Chaotic systems are sensitive to tiny errors. This short rollout is useful
-    for teaching the difference between:
-
-    - one-step prediction, where the true current input is supplied
-    - free-running prediction, where the model feeds back its own output
+    This is used for Mackey-Glass, where the input signal and target signal are
+    the same time series. It is not used for NARMA, because NARMA is driven by
+    an external random input sequence.
 
     We clip the feedback to the training range before reinjecting it. That keeps
     the demonstration numerically well behaved and easy to inspect.
@@ -396,8 +473,8 @@ def predict_short_free_run(
 
     for _ in range(SHORT_FREE_RUN_STEPS):
         clipped_value_z = float(np.clip(current_value_z, train_z_min, train_z_max))
-        clipped_value = denormalize(clipped_value_z, train_mean, train_std)
-        input_value_01 = scale_to_unit_interval(clipped_value, train_min, train_max)
+        clipped_value = denormalize(clipped_value_z, input_mean, input_std)
+        input_value_01 = scale_to_unit_interval(clipped_value, input_min, input_max)
 
         qrc_measurements = reservoir.step(input_value_01)
         features = readout_features(clipped_value_z, qrc_measurements)
@@ -410,165 +487,239 @@ def predict_short_free_run(
     return np.array(predictions)
 
 
-def fit_memoryless_baseline(series_z):
-    """Fit y(t+1) from only y(t), with no reservoir state."""
+def fit_memoryless_baseline(input_z, target_z):
+    """Fit target(t+1) from only input(t), with no reservoir state."""
 
     features = []
     targets = []
 
     for t in range(WASHOUT_STEPS, TRAIN_STEPS):
-        features.append([1.0, series_z[t]])
-        targets.append(series_z[t + 1])
+        features.append([1.0, input_z[t]])
+        targets.append(target_z[t + 1])
 
     features = np.array(features)
     targets = np.array(targets)
     return fit_ridge_regression(features, targets, RIDGE)
 
 
-def make_plot(
-    one_step_predictions,
-    one_step_targets,
-    free_predictions,
-    free_targets,
-    output_path,
-):
-    """Save a small plot that students can compare with the printed RMSE."""
+def run_qrc_task(task_name, input_signal, target_signal, include_short_free_run):
+    """Train and evaluate the same QRC architecture on one task."""
 
-    n_one_step_to_show = 300
+    prepared = prepare_task_signals(input_signal, target_signal)
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
-
-    axes[0].plot(
-        one_step_targets[:n_one_step_to_show],
-        label="true Mackey-Glass",
-        linewidth=2,
+    reservoir, readout_weights = train_qrc(
+        prepared["input_z"],
+        prepared["target_z"],
+        prepared["input_values_01"],
     )
-    axes[0].plot(
-        one_step_predictions[:n_one_step_to_show],
-        label="QRC one-step prediction",
-        linestyle="--",
-    )
-    axes[0].set_title("One-step prediction")
-    axes[0].set_ylabel("x(t)")
-    axes[0].legend()
+    state_after_training = reservoir.get_state()
 
-    axes[1].plot(free_targets, label="true Mackey-Glass", linewidth=2)
-    axes[1].plot(
-        free_predictions,
-        label="short free-running QRC",
-        linestyle="--",
+    predictions_z = predict_one_step(
+        reservoir,
+        readout_weights,
+        prepared["input_z"],
+        prepared["input_values_01"],
     )
-    axes[1].set_title("Short free-running prediction")
-    axes[1].set_xlabel("test step")
-    axes[1].set_ylabel("x(t)")
-    axes[1].legend()
+    targets_z = prepared["target_z"][TRAIN_STEPS + 1 : TRAIN_STEPS + TEST_STEPS + 1]
 
+    baseline_weights = fit_memoryless_baseline(
+        prepared["input_z"],
+        prepared["target_z"],
+    )
+    baseline_predictions_z = np.array(
+        [
+            np.array([1.0, prepared["input_z"][t]]) @ baseline_weights
+            for t in range(TRAIN_STEPS, TRAIN_STEPS + TEST_STEPS)
+        ]
+    )
+
+    predictions = denormalize(
+        predictions_z,
+        prepared["target_mean"],
+        prepared["target_std"],
+    )
+    targets = denormalize(
+        targets_z,
+        prepared["target_mean"],
+        prepared["target_std"],
+    )
+
+    result = {
+        "task_name": task_name,
+        "predictions_z": predictions_z,
+        "targets_z": targets_z,
+        "predictions": predictions,
+        "targets": targets,
+        "qrc_rmse_z": rmse(predictions_z, targets_z),
+        "qrc_rmse": rmse(predictions, targets),
+        "baseline_rmse_z": rmse(baseline_predictions_z, targets_z),
+        "reservoir_shape": reservoir.rho.shape,
+        "short_free_run_rmse_z": None,
+        "short_free_run_rmse": None,
+        "short_free_run_predictions": None,
+        "short_free_run_targets": None,
+    }
+
+    if include_short_free_run:
+        reservoir.set_state(state_after_training)
+        free_predictions_z = predict_short_self_feedback_run(
+            reservoir,
+            readout_weights,
+            first_input_z=prepared["input_z"][TRAIN_STEPS],
+            train_z_min=prepared["input_z"][:TRAIN_STEPS].min(),
+            train_z_max=prepared["input_z"][:TRAIN_STEPS].max(),
+            input_mean=prepared["input_mean"],
+            input_std=prepared["input_std"],
+            input_min=prepared["input_min"],
+            input_max=prepared["input_max"],
+        )
+        free_targets_z = prepared["target_z"][
+            TRAIN_STEPS + 1 : TRAIN_STEPS + SHORT_FREE_RUN_STEPS + 1
+        ]
+
+        free_predictions = denormalize(
+            free_predictions_z,
+            prepared["target_mean"],
+            prepared["target_std"],
+        )
+        free_targets = denormalize(
+            free_targets_z,
+            prepared["target_mean"],
+            prepared["target_std"],
+        )
+
+        result["short_free_run_rmse_z"] = rmse(free_predictions_z, free_targets_z)
+        result["short_free_run_rmse"] = rmse(free_predictions, free_targets)
+        result["short_free_run_predictions"] = free_predictions
+        result["short_free_run_targets"] = free_targets
+
+    return result
+
+
+def make_comparison_plot(results, output_path):
+    """Save a plot comparing QRC predictions on both tasks."""
+
+    n_to_show = 300
+
+    fig, axes = plt.subplots(len(results), 1, figsize=(10, 7), sharex=False)
+
+    for axis, result in zip(axes, results):
+        axis.plot(
+            result["targets"][:n_to_show],
+            label="true target",
+            linewidth=2,
+        )
+        axis.plot(
+            result["predictions"][:n_to_show],
+            label="QRC prediction",
+            linestyle="--",
+        )
+        axis.set_title(
+            f"{result['task_name']}: QRC RMSE {result['qrc_rmse_z']:.4f}, "
+            f"memoryless baseline {result['baseline_rmse_z']:.4f}"
+        )
+        axis.set_ylabel("target")
+        axis.legend()
+
+    axes[-1].set_xlabel("test step")
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
 
-def main():
-    total_points_needed = TRAIN_STEPS + TEST_STEPS + 1
-    series = make_mackey_glass(total_points_needed)
+def make_summary(results, plot_path):
+    """Build the printed and saved text summary."""
 
-    # Normalize using only the training part. This avoids leaking test
-    # statistics into training.
-    train_values = series[:TRAIN_STEPS]
-    train_mean = train_values.mean()
-    train_std = train_values.std()
-    series_z = (series - train_mean) / train_std
-
-    # The quantum input qubit expects a value in [0, 1]. The min and max also
-    # come only from the training part.
-    train_min = train_values.min()
-    train_max = train_values.max()
-    input_values_01 = scale_to_unit_interval(series, train_min, train_max)
-
-    reservoir, readout_weights = train_qrc(series_z, input_values_01)
-    state_after_training = reservoir.get_state()
-
-    one_step_predictions_z = predict_one_step(
-        reservoir,
-        readout_weights,
-        series_z,
-        input_values_01,
-    )
-    one_step_targets_z = series_z[TRAIN_STEPS + 1 : TRAIN_STEPS + TEST_STEPS + 1]
-
-    # Restore the quantum state from the exact end of training before the short
-    # autonomous rollout.
-    reservoir.set_state(state_after_training)
-    free_predictions_z = predict_short_free_run(
-        reservoir,
-        readout_weights,
-        first_input_z=series_z[TRAIN_STEPS],
-        train_z_min=series_z[:TRAIN_STEPS].min(),
-        train_z_max=series_z[:TRAIN_STEPS].max(),
-        train_mean=train_mean,
-        train_std=train_std,
-        train_min=train_min,
-        train_max=train_max,
-    )
-    free_targets_z = series_z[
-        TRAIN_STEPS + 1 : TRAIN_STEPS + SHORT_FREE_RUN_STEPS + 1
+    lines = [
+        "Quantum spin reservoir time-series comparison",
+        "",
+        "Same QRC settings for both tasks:",
+        f"- {N_QUBITS} qubits",
+        f"- {VIRTUAL_NODES} virtual measurement nodes per input",
+        f"- evolution time {EVOLUTION_TIME}",
+        f"- ridge {RIDGE}",
+        f"- Hamiltonian seed {SEED}",
+        f"- density-matrix state rho with shape {results[0]['reservoir_shape']}",
+        "",
+        "Task results:",
     ]
 
-    baseline_weights = fit_memoryless_baseline(series_z)
-    baseline_predictions_z = np.array(
+    for result in results:
+        lines.extend(
+            [
+                "",
+                f"{result['task_name']}:",
+                f"- QRC one-step RMSE, normalized scale:       "
+                f"{result['qrc_rmse_z']:.6f}",
+                f"- QRC one-step RMSE, original scale:         "
+                f"{result['qrc_rmse']:.6f}",
+                f"- Memoryless one-step baseline RMSE:         "
+                f"{result['baseline_rmse_z']:.6f}",
+            ]
+        )
+
+        if result["short_free_run_rmse_z"] is not None:
+            lines.extend(
+                [
+                    f"- Short free-run QRC RMSE, normalized scale: "
+                    f"{result['short_free_run_rmse_z']:.6f}",
+                    f"- Short free-run QRC RMSE, original scale:   "
+                    f"{result['short_free_run_rmse']:.6f}",
+                ]
+            )
+
+    lines.extend(
         [
-            np.array([1.0, series_z[t]]) @ baseline_weights
-            for t in range(TRAIN_STEPS, TRAIN_STEPS + TEST_STEPS)
+            "",
+            "Takeaway:",
+            "- Mackey-Glass is predicted very accurately by this small QRC.",
+            "- NARMA10 is harder for the same reservoir settings.",
+            "- This is the lesson: reservoir performance depends on the task,",
+            "  even when the reservoir architecture is unchanged.",
+            "",
+            "Plot saved to:",
+            str(plot_path),
+            "",
+            "Notes:",
+            "- The reservoir is a quantum spin system.",
+            "- The trained model is only the final linear readout.",
+            "- The quantum density matrix rho is the model memory.",
+            "- rho is never reset inside the time loop.",
         ]
     )
 
-    one_step_predictions = denormalize(one_step_predictions_z, train_mean, train_std)
-    one_step_targets = denormalize(one_step_targets_z, train_mean, train_std)
-    free_predictions = denormalize(free_predictions_z, train_mean, train_std)
-    free_targets = denormalize(free_targets_z, train_mean, train_std)
+    return "\n".join(lines) + "\n"
 
-    one_step_rmse_z = rmse(one_step_predictions_z, one_step_targets_z)
-    one_step_rmse = rmse(one_step_predictions, one_step_targets)
-    free_rmse_z = rmse(free_predictions_z, free_targets_z)
-    free_rmse = rmse(free_predictions, free_targets)
-    baseline_rmse_z = rmse(baseline_predictions_z, one_step_targets_z)
+
+def main():
+    total_points_needed = TRAIN_STEPS + TEST_STEPS + 1
+
+    mackey_glass = make_mackey_glass(total_points_needed)
+    narma_input, narma_output = make_narma(total_points_needed)
+
+    results = [
+        run_qrc_task(
+            task_name="Mackey-Glass",
+            input_signal=mackey_glass,
+            target_signal=mackey_glass,
+            include_short_free_run=True,
+        ),
+        run_qrc_task(
+            task_name=f"NARMA{NARMA_ORDER}",
+            input_signal=narma_input,
+            target_signal=narma_output,
+            include_short_free_run=False,
+        ),
+    ]
 
     repo_dir = Path(__file__).resolve().parent
     results_dir = repo_dir / "results"
     results_dir.mkdir(exist_ok=True)
-    plot_path = results_dir / "mackey_glass_qrc_prediction.png"
+    plot_path = results_dir / "qrc_time_series_comparison.png"
     metrics_path = results_dir / "metrics.txt"
 
-    make_plot(
-        one_step_predictions,
-        one_step_targets,
-        free_predictions,
-        free_targets,
-        plot_path,
-    )
-
-    summary = f"""Mackey-Glass quantum spin reservoir results
-
-One-step QRC RMSE, normalized scale:       {one_step_rmse_z:.6f}
-One-step QRC RMSE, original scale:         {one_step_rmse:.6f}
-Short free-run QRC RMSE, normalized scale: {free_rmse_z:.6f}
-Short free-run QRC RMSE, original scale:   {free_rmse:.6f}
-Memoryless one-step baseline RMSE:         {baseline_rmse_z:.6f}
-
-Reservoir:
-- {N_QUBITS} qubits
-- {VIRTUAL_NODES} virtual measurement nodes per input
-- density-matrix state rho with shape {reservoir.rho.shape}
-
-Plot saved to:
-{plot_path}
-
-Notes:
-- The reservoir is a quantum spin system.
-- The trained model is only the final linear readout.
-- The quantum density matrix rho is the model memory.
-- rho is never reset inside the time loop.
-"""
+    make_comparison_plot(results, plot_path)
+    summary = make_summary(results, plot_path.relative_to(repo_dir))
 
     print(summary)
     metrics_path.write_text(summary)
@@ -576,4 +727,3 @@ Notes:
 
 if __name__ == "__main__":
     main()
-
